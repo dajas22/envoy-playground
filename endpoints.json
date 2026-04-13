@@ -1,0 +1,32 @@
+{
+  "cluster_name": "backend_cluster",
+  "cluster_lb_policy": "RING_HASH",
+  "endpoint_groups": [
+    {
+        "priority": 0,
+        "locality": {
+          "region": "test-region",
+          "zone": "test-zone-a",
+          "sub_zone": "primary"
+        },
+        "endpoints": [{
+            "address": "192.168.1.54",
+            "port": 8080
+        }]
+    },
+    {
+      "priority": 1,
+      "locality": {
+        "region": "test-region",
+        "zone": "test-zone-b",
+        "sub_zone": "failover"
+      },
+      "endpoints": [
+        {
+          "address": "192.168.1.55",
+          "port": 8080
+        }
+      ]
+    }
+  ]
+}
