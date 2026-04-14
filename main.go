@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,59 +27,72 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+	"gopkg.in/yaml.v3"
 )
 
 const (
-	port           = ":5000"
-	edsTypeURL     = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment"
-	cdsTypeURL     = "type.googleapis.com/envoy.config.cluster.v3.Cluster"
-	backendCluster = "backend_cluster"
-	xdsClusterName = "xds_cluster"
-	defaultConfig  = "endpoints.json"
+	port          = ":5000"
+	edsTypeURL    = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment"
+	cdsTypeURL    = "type.googleapis.com/envoy.config.cluster.v3.Cluster"
+	xdsCluster    = "xds_cluster"
+	defaultConfig = "endpoints.yaml"
 )
 
 var watchInterval = 1 * time.Second
 
 type endpointFileConfig struct {
-	ClusterName     string                `json:"cluster_name"`
-	ClusterLBPolicy string                `json:"cluster_lb_policy"`
-	ClusterType     string                `json:"cluster_type"`
-	EndpointGroups  []endpointGroupConfig `json:"endpoint_groups"`
+	// Preferred format: multiple services under services[].
+	Services []serviceConfig `yaml:"services"`
+
+	// Backward compatibility for old single-service top-level format.
+	ClusterName     string                `yaml:"cluster_name"`
+	ClusterLBPolicy string                `yaml:"cluster_lb_policy"`
+	ClusterType     string                `yaml:"cluster_type"`
+	EndpointGroups  []endpointGroupConfig `yaml:"endpoint_groups"`
+}
+
+type serviceConfig struct {
+	ClusterName     string                `yaml:"cluster_name"`
+	ClusterLBPolicy string                `yaml:"cluster_lb_policy"`
+	ClusterType     string                `yaml:"cluster_type"`
+	EndpointGroups  []endpointGroupConfig `yaml:"endpoint_groups"`
 }
 
 type endpointGroupConfig struct {
-	Priority  uint32           `json:"priority"`
-	Locality  endpointLocality `json:"locality"`
-	Endpoints []hostConfig     `json:"endpoints"`
+	Priority  uint32           `yaml:"priority"`
+	Locality  endpointLocality `yaml:"locality"`
+	Endpoints []hostConfig     `yaml:"endpoints"`
 }
 
 type endpointLocality struct {
-	Region  string `json:"region"`
-	Zone    string `json:"zone"`
-	SubZone string `json:"sub_zone"`
+	Region  string `yaml:"region"`
+	Zone    string `yaml:"zone"`
+	SubZone string `yaml:"sub_zone"`
 }
 
 type hostConfig struct {
-	Address string `json:"address"`
-	Port    uint32 `json:"port"`
+	Address string `yaml:"address"`
+	Port    uint32 `yaml:"port"`
 }
 
-type ConfigStore struct {
-	mu              sync.RWMutex
+type serviceState struct {
 	assignment      *endpointv3.ClusterLoadAssignment
 	clusterLBPolicy clusterv3.Cluster_LbPolicy
 	clusterType     clusterv3.Cluster_DiscoveryType
-	version         uint64
-	subscribers     map[chan struct{}]struct{}
 }
 
-func NewConfigStore(assignment *endpointv3.ClusterLoadAssignment, clusterLBPolicy clusterv3.Cluster_LbPolicy, clusterType clusterv3.Cluster_DiscoveryType) *ConfigStore {
+type ConfigStore struct {
+	mu          sync.RWMutex
+	services    map[string]serviceState
+	version     uint64
+	subscribers map[chan struct{}]struct{}
+}
+
+func NewConfigStore(services map[string]serviceState) *ConfigStore {
 	return &ConfigStore{
-		assignment:      assignment,
-		clusterLBPolicy: clusterLBPolicy,
-		clusterType:     clusterType,
-		version:         1,
-		subscribers:     make(map[chan struct{}]struct{}),
+		services:    services,
+		version:     1,
+		subscribers: make(map[chan struct{}]struct{}),
 	}
 }
 
@@ -98,38 +111,139 @@ func (s *ConfigStore) Unsubscribe(ch chan struct{}) {
 	close(ch)
 }
 
+func (s *ConfigStore) ServiceNames() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	names := make([]string, 0, len(s.services))
+	for name := range s.services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 func (s *ConfigStore) Snapshot(resourceNames []string) (string, string, []*anypb.Any, error) {
 	s.mu.RLock()
-	assignment := s.assignment
 	version := s.version
+	services := copyServiceMap(s.services)
 	s.mu.RUnlock()
 
 	versionInfo := strconv.FormatUint(version, 10)
-	if assignment == nil {
-		return versionInfo, versionInfo, []*anypb.Any{}, nil
+	resources := make([]*anypb.Any, 0, len(services))
+
+	names := sortedServiceNames(services)
+	for _, name := range names {
+		svc := services[name]
+		if svc.assignment == nil {
+			continue
+		}
+		if !isResourceRequested(resourceNames, name) {
+			continue
+		}
+
+		anyAssignment, err := anypb.New(svc.assignment)
+		if err != nil {
+			return "", "", nil, err
+		}
+		resources = append(resources, anyAssignment)
 	}
 
-	if !isResourceRequested(resourceNames, assignment.ClusterName) {
-		return versionInfo, versionInfo, []*anypb.Any{}, nil
-	}
-
-	anyAssignment, err := anypb.New(assignment)
-	if err != nil {
-		return "", "", nil, err
-	}
-
-	return versionInfo, versionInfo, []*anypb.Any{anyAssignment}, nil
+	return versionInfo, versionInfo, resources, nil
 }
 
-func (s *ConfigStore) Update(assignment *endpointv3.ClusterLoadAssignment, clusterLBPolicy clusterv3.Cluster_LbPolicy, clusterType clusterv3.Cluster_DiscoveryType) string {
-	if assignment == nil {
-		return ""
+func (s *ConfigStore) ClusterSnapshot(resourceNames []string) (string, string, []*anypb.Any, error) {
+	s.mu.RLock()
+	version := s.version
+	services := copyServiceMap(s.services)
+	s.mu.RUnlock()
+
+	versionInfo := strconv.FormatUint(version, 10)
+	resources := make([]*anypb.Any, 0, len(services))
+
+	names := sortedServiceNames(services)
+	for _, name := range names {
+		svc := services[name]
+		if svc.assignment == nil {
+			continue
+		}
+		if !isResourceRequested(resourceNames, name) {
+			continue
+		}
+
+		cluster := buildBackendCluster(name, svc.clusterLBPolicy, svc.clusterType)
+		anyCluster, err := anypb.New(cluster)
+		if err != nil {
+			return "", "", nil, err
+		}
+		resources = append(resources, anyCluster)
 	}
 
+	return versionInfo, versionInfo, resources, nil
+}
+
+func (s *ConfigStore) DeltaEndpointResources(includeAll bool, subscribed map[string]struct{}) (string, []*discoveryv3.Resource, error) {
+	s.mu.RLock()
+	version := s.version
+	services := copyServiceMap(s.services)
+	s.mu.RUnlock()
+
+	versionStr := strconv.FormatUint(version, 10)
+	names := targetNames(services, includeAll, subscribed)
+	resources := make([]*discoveryv3.Resource, 0, len(names))
+
+	for _, name := range names {
+		svc := services[name]
+		if svc.assignment == nil {
+			continue
+		}
+		anyAssignment, err := anypb.New(svc.assignment)
+		if err != nil {
+			return "", nil, err
+		}
+		resources = append(resources, &discoveryv3.Resource{
+			Name:     name,
+			Version:  versionStr,
+			Resource: anyAssignment,
+		})
+	}
+
+	return versionStr, resources, nil
+}
+
+func (s *ConfigStore) DeltaClusterResources(includeAll bool, subscribed map[string]struct{}) (string, []*discoveryv3.Resource, error) {
+	s.mu.RLock()
+	version := s.version
+	services := copyServiceMap(s.services)
+	s.mu.RUnlock()
+
+	versionStr := strconv.FormatUint(version, 10)
+	names := targetNames(services, includeAll, subscribed)
+	resources := make([]*discoveryv3.Resource, 0, len(names))
+
+	for _, name := range names {
+		svc := services[name]
+		if svc.assignment == nil {
+			continue
+		}
+		cluster := buildBackendCluster(name, svc.clusterLBPolicy, svc.clusterType)
+		anyCluster, err := anypb.New(cluster)
+		if err != nil {
+			return "", nil, err
+		}
+		resources = append(resources, &discoveryv3.Resource{
+			Name:     name,
+			Version:  versionStr,
+			Resource: anyCluster,
+		})
+	}
+
+	return versionStr, resources, nil
+}
+
+func (s *ConfigStore) Update(services map[string]serviceState) string {
 	s.mu.Lock()
-	s.assignment = assignment
-	s.clusterLBPolicy = clusterLBPolicy
-	s.clusterType = clusterType
+	s.services = services
 	s.version++
 	versionInfo := strconv.FormatUint(s.version, 10)
 	subscribers := make([]chan struct{}, 0, len(s.subscribers))
@@ -146,57 +260,6 @@ func (s *ConfigStore) Update(assignment *endpointv3.ClusterLoadAssignment, clust
 	}
 
 	return versionInfo
-}
-
-// DeltaResource returns the current ClusterLoadAssignment as a Delta xDS Resource.
-func (s *ConfigStore) DeltaResource() (string, *discoveryv3.Resource, error) {
-	s.mu.RLock()
-	assignment := s.assignment
-	version := s.version
-	s.mu.RUnlock()
-
-	versionStr := strconv.FormatUint(version, 10)
-	if assignment == nil {
-		return versionStr, nil, nil
-	}
-
-	anyAssignment, err := anypb.New(assignment)
-	if err != nil {
-		return "", nil, err
-	}
-
-	return versionStr, &discoveryv3.Resource{
-		Name:     assignment.ClusterName,
-		Version:  versionStr,
-		Resource: anyAssignment,
-	}, nil
-}
-
-// ClusterDeltaResource returns backend cluster config as a Delta xDS Resource.
-func (s *ConfigStore) ClusterDeltaResource() (string, *discoveryv3.Resource, error) {
-	s.mu.RLock()
-	assignment := s.assignment
-	clusterLBPolicy := s.clusterLBPolicy
-	clusterType := s.clusterType
-	version := s.version
-	s.mu.RUnlock()
-
-	versionStr := strconv.FormatUint(version, 10)
-	if assignment == nil {
-		return versionStr, nil, nil
-	}
-
-	cluster := buildBackendCluster(assignment.ClusterName, clusterLBPolicy, clusterType)
-	anyCluster, err := anypb.New(cluster)
-	if err != nil {
-		return "", nil, err
-	}
-
-	return versionStr, &discoveryv3.Resource{
-		Name:     cluster.Name,
-		Version:  versionStr,
-		Resource: anyCluster,
-	}, nil
 }
 
 // EDSServer implements the endpoint and cluster discovery service.
@@ -329,44 +392,38 @@ func (s *EDSServer) DeltaEndpoints(stream edsv3.EndpointDiscoveryService_DeltaEn
 		}
 	}()
 
-	// Resources the client is subscribed to.
 	subscribed := map[string]struct{}{}
-	// Per-resource version last confirmed by the client (ACKed or from InitialResourceVersions).
-	// We use the version string as the nonce for this single-resource server.
+	subscribedAll := false
 	clientVersions := map[string]string{}
 
 	sendDelta := func(reason string) error {
-		sysVersion, res, err := s.store.DeltaResource()
+		sysVersion, resources, err := s.store.DeltaEndpointResources(subscribedAll, subscribed)
 		if err != nil {
 			return err
 		}
-		if res == nil {
-			return nil
-		}
 
-		// Only send if client is subscribed to this resource.
-		if _, ok := subscribed[res.Name]; !ok {
-			return nil
+		out := make([]*discoveryv3.Resource, 0, len(resources))
+		for _, res := range resources {
+			if clientVersions[res.Name] != res.Version {
+				out = append(out, res)
+			}
 		}
-
-		// Skip if client already has this version.
-		if clientVersions[res.Name] == res.Version {
+		if len(out) == 0 {
 			return nil
 		}
 
 		resp := &discoveryv3.DeltaDiscoveryResponse{
 			SystemVersionInfo: sysVersion,
-			Resources:         []*discoveryv3.Resource{res},
+			Resources:         out,
 			TypeUrl:           edsTypeURL,
-			Nonce:             res.Version,
+			Nonce:             sysVersion,
 		}
 
 		if err := stream.Send(resp); err != nil {
 			return err
 		}
 
-		log.Printf("Sent delta EDS (%s): system_version=%s resource=%s version=%s\n",
-			reason, sysVersion, res.Name, res.Version)
+		log.Printf("Sent delta EDS (%s): system_version=%s resources=%d\n", reason, sysVersion, len(out))
 		return nil
 	}
 
@@ -391,15 +448,20 @@ func (s *EDSServer) DeltaEndpoints(stream edsv3.EndpointDiscoveryService_DeltaEn
 				continue
 			}
 
-			// Seed client's known versions on reconnect.
 			for name, ver := range req.InitialResourceVersions {
 				clientVersions[name] = ver
 			}
-
+			if len(req.ResourceNamesSubscribe) == 0 && len(req.ResourceNamesUnsubscribe) == 0 && len(req.InitialResourceVersions) == 0 && len(subscribed) == 0 {
+				subscribedAll = true
+			}
 			for _, name := range req.ResourceNamesSubscribe {
 				subscribed[name] = struct{}{}
+				subscribedAll = false
 			}
 			for _, name := range req.ResourceNamesUnsubscribe {
+				if subscribedAll {
+					subscribed[name] = struct{}{}
+				}
 				delete(subscribed, name)
 				delete(clientVersions, name)
 			}
@@ -408,10 +470,15 @@ func (s *EDSServer) DeltaEndpoints(stream edsv3.EndpointDiscoveryService_DeltaEn
 				req.ResourceNamesSubscribe, req.ResourceNamesUnsubscribe, req.ResponseNonce)
 
 			if req.ErrorDetail != nil {
-				// NACK: client rejected last response — clear version so we resend.
 				log.Printf("Delta EDS NACK (nonce=%q): %s\n", req.ResponseNonce, req.ErrorDetail.Message)
-				for name := range subscribed {
-					delete(clientVersions, name)
+				if subscribedAll {
+					for _, name := range s.store.ServiceNames() {
+						delete(clientVersions, name)
+					}
+				} else {
+					for name := range subscribed {
+						delete(clientVersions, name)
+					}
 				}
 				if err := sendDelta("nack-retry"); err != nil {
 					return err
@@ -419,11 +486,15 @@ func (s *EDSServer) DeltaEndpoints(stream edsv3.EndpointDiscoveryService_DeltaEn
 				continue
 			}
 
-			// ACK: client confirmed versions up to the returned nonce.
-			// Since nonce == resource version, we can advance clientVersions directly.
 			if req.ResponseNonce != "" {
-				for name := range subscribed {
-					clientVersions[name] = req.ResponseNonce
+				if subscribedAll {
+					for _, name := range s.store.ServiceNames() {
+						clientVersions[name] = req.ResponseNonce
+					}
+				} else {
+					for name := range subscribed {
+						clientVersions[name] = req.ResponseNonce
+					}
 				}
 			}
 
@@ -432,7 +503,7 @@ func (s *EDSServer) DeltaEndpoints(stream edsv3.EndpointDiscoveryService_DeltaEn
 				return err
 			}
 		case <-updates:
-			if len(subscribed) == 0 {
+			if !subscribedAll && len(subscribed) == 0 {
 				continue
 			}
 			if err := sendDelta("config update"); err != nil {
@@ -473,42 +544,23 @@ func (s *EDSServer) StreamClusters(stream cdsv3.ClusterDiscoveryService_StreamCl
 	resourceNames := []string{}
 
 	sendSnapshot := func(reason string) error {
-		s.store.mu.RLock()
-		assignment := s.store.assignment
-		clusterLBPolicy := s.store.clusterLBPolicy
-		clusterType := s.store.clusterType
-		version := s.store.version
-		s.store.mu.RUnlock()
-
-		versionStr := strconv.FormatUint(version, 10)
-		if assignment == nil {
-			resp := &discoveryv3.DiscoveryResponse{
-				VersionInfo: versionStr,
-				Resources:   []*anypb.Any{},
-				TypeUrl:     cdsTypeURL,
-				Nonce:       versionStr,
-			}
-			return stream.Send(resp)
-		}
-
-		cluster := buildBackendCluster(assignment.ClusterName, clusterLBPolicy, clusterType)
-		anyCluster, err := anypb.New(cluster)
+		version, nonce, resources, err := s.store.ClusterSnapshot(resourceNames)
 		if err != nil {
 			return err
 		}
 
 		resp := &discoveryv3.DiscoveryResponse{
-			VersionInfo: versionStr,
-			Resources:   []*anypb.Any{anyCluster},
+			VersionInfo: version,
+			Resources:   resources,
 			TypeUrl:     cdsTypeURL,
-			Nonce:       versionStr,
+			Nonce:       nonce,
 		}
 
 		if err := stream.Send(resp); err != nil {
 			return err
 		}
 
-		log.Printf("Sent CDS response (%s): version=%s resources=%d\n", reason, versionStr, len(resp.Resources))
+		log.Printf("Sent CDS response (%s): version=%s resources=%d\n", reason, version, len(resources))
 		return nil
 	}
 
@@ -590,34 +642,32 @@ func (s *EDSServer) DeltaClusters(stream cdsv3.ClusterDiscoveryService_DeltaClus
 	clientVersions := map[string]string{}
 
 	sendDelta := func(reason string) error {
-		sysVersion, res, err := s.store.ClusterDeltaResource()
+		sysVersion, resources, err := s.store.DeltaClusterResources(subscribedAll, subscribed)
 		if err != nil {
 			return err
 		}
-		if res == nil {
-			return nil
-		}
-		if !subscribedAll {
-			if _, ok := subscribed[res.Name]; !ok {
-				return nil
+
+		out := make([]*discoveryv3.Resource, 0, len(resources))
+		for _, res := range resources {
+			if clientVersions[res.Name] != res.Version {
+				out = append(out, res)
 			}
 		}
-		if clientVersions[res.Name] == res.Version {
+		if len(out) == 0 {
 			return nil
 		}
 
 		resp := &discoveryv3.DeltaDiscoveryResponse{
 			SystemVersionInfo: sysVersion,
-			Resources:         []*discoveryv3.Resource{res},
+			Resources:         out,
 			TypeUrl:           cdsTypeURL,
-			Nonce:             res.Version,
+			Nonce:             sysVersion,
 		}
 		if err := stream.Send(resp); err != nil {
 			return err
 		}
 
-		log.Printf("Sent delta CDS (%s): system_version=%s resource=%s version=%s\n",
-			reason, sysVersion, res.Name, res.Version)
+		log.Printf("Sent delta CDS (%s): system_version=%s resources=%d\n", reason, sysVersion, len(out))
 		return nil
 	}
 
@@ -646,7 +696,6 @@ func (s *EDSServer) DeltaClusters(stream cdsv3.ClusterDiscoveryService_DeltaClus
 				clientVersions[name] = ver
 			}
 			if len(req.ResourceNamesSubscribe) == 0 && len(req.ResourceNamesUnsubscribe) == 0 && len(req.InitialResourceVersions) == 0 && len(subscribed) == 0 {
-				// Envoy Delta CDS can start in wildcard mode with empty subscribe list.
 				subscribedAll = true
 			}
 			for _, name := range req.ResourceNamesSubscribe {
@@ -666,8 +715,14 @@ func (s *EDSServer) DeltaClusters(stream cdsv3.ClusterDiscoveryService_DeltaClus
 
 			if req.ErrorDetail != nil {
 				log.Printf("Delta CDS NACK (nonce=%q): %s\n", req.ResponseNonce, req.ErrorDetail.Message)
-				for name := range subscribed {
-					delete(clientVersions, name)
+				if subscribedAll {
+					for _, name := range s.store.ServiceNames() {
+						delete(clientVersions, name)
+					}
+				} else {
+					for name := range subscribed {
+						delete(clientVersions, name)
+					}
 				}
 				if err := sendDelta("nack-retry"); err != nil {
 					return err
@@ -677,9 +732,8 @@ func (s *EDSServer) DeltaClusters(stream cdsv3.ClusterDiscoveryService_DeltaClus
 
 			if req.ResponseNonce != "" {
 				if subscribedAll {
-					sysVersion, res, err := s.store.ClusterDeltaResource()
-					if err == nil && res != nil && req.ResponseNonce == sysVersion {
-						clientVersions[res.Name] = req.ResponseNonce
+					for _, name := range s.store.ServiceNames() {
+						clientVersions[name] = req.ResponseNonce
 					}
 				} else {
 					for name := range subscribed {
@@ -722,12 +776,12 @@ func main() {
 		log.Fatalf("Failed to prepare config file %s: %v", configPath, err)
 	}
 
-	assignment, clusterLBPolicy, clusterType, err := loadAssignmentFromFile(configPath)
+	services, err := loadServicesFromFile(configPath)
 	if err != nil {
 		log.Fatalf("Failed to load initial endpoint config %s: %v", configPath, err)
 	}
 
-	store := NewConfigStore(assignment, clusterLBPolicy, clusterType)
+	store := NewConfigStore(services)
 	watchCtx, cancelWatch := context.WithCancel(context.Background())
 	defer cancelWatch()
 	go watchConfigFile(watchCtx, configPath, store)
@@ -809,14 +863,14 @@ func watchConfigFile(ctx context.Context, configPath string, store *ConfigStore)
 				continue
 			}
 
-			assignment, clusterLBPolicy, clusterType, err := loadAssignmentFromFile(configPath)
+			services, err := loadServicesFromFile(configPath)
 			if err != nil {
 				log.Printf("Config reload failed: %v\n", err)
 				lastMod = stat.ModTime()
 				continue
 			}
 
-			version := store.Update(assignment, clusterLBPolicy, clusterType)
+			version := store.Update(services)
 			lastMod = stat.ModTime()
 			log.Printf("Reloaded endpoint config from %s, version=%s\n", configPath, version)
 		}
@@ -839,13 +893,12 @@ func ensureConfigFile(configPath string) error {
 		}
 	}
 
-	configJSON, err := json.MarshalIndent(defaultEndpointConfig(), "", "  ")
+	configYAML, err := yaml.Marshal(defaultEndpointConfig())
 	if err != nil {
 		return err
 	}
-	configJSON = append(configJSON, '\n')
 
-	if err := os.WriteFile(configPath, configJSON, 0o644); err != nil {
+	if err := os.WriteFile(configPath, configYAML, 0o644); err != nil {
 		return err
 	}
 
@@ -853,65 +906,110 @@ func ensureConfigFile(configPath string) error {
 	return nil
 }
 
-func loadAssignmentFromFile(configPath string) (*endpointv3.ClusterLoadAssignment, clusterv3.Cluster_LbPolicy, clusterv3.Cluster_DiscoveryType, error) {
+func loadServicesFromFile(configPath string) (map[string]serviceState, error) {
 	content, err := os.ReadFile(configPath)
 	if err != nil {
-		return nil, clusterv3.Cluster_ROUND_ROBIN, clusterv3.Cluster_EDS, err
+		return nil, err
 	}
 
-	var config endpointFileConfig
-	if err := json.Unmarshal(content, &config); err != nil {
-		return nil, clusterv3.Cluster_ROUND_ROBIN, clusterv3.Cluster_EDS, fmt.Errorf("invalid JSON: %w", err)
+	var root yaml.Node
+	if err := yaml.Unmarshal(content, &root); err != nil {
+		return nil, fmt.Errorf("invalid YAML: %w", err)
+	}
+	if len(root.Content) == 0 {
+		return nil, fmt.Errorf("invalid YAML: empty document")
 	}
 
-	clusterName := config.ClusterName
-	if clusterName == "" {
-		clusterName = backendCluster
-	}
-
-	clusterLBPolicy, err := parseLBPolicy(config.ClusterLBPolicy)
-	if err != nil {
-		return nil, clusterv3.Cluster_ROUND_ROBIN, clusterv3.Cluster_EDS, err
-	}
-
-	clusterType, err := parseClusterType(config.ClusterType)
-	if err != nil {
-		return nil, clusterv3.Cluster_ROUND_ROBIN, clusterv3.Cluster_EDS, err
-	}
-
-	localityGroups := make([]*endpointv3.LocalityLbEndpoints, 0, len(config.EndpointGroups))
-	for i, group := range config.EndpointGroups {
-		if len(group.Endpoints) == 0 {
-			return nil, clusterv3.Cluster_ROUND_ROBIN, clusterv3.Cluster_EDS, fmt.Errorf("endpoint_groups[%d] must contain at least one endpoint", i)
+	var servicesCfg []serviceConfig
+	switch root.Content[0].Kind {
+	case yaml.SequenceNode:
+		// Support top-level array format: [ {cluster_name: ...}, ... ]
+		if err := root.Content[0].Decode(&servicesCfg); err != nil {
+			return nil, fmt.Errorf("invalid YAML service array: %w", err)
+		}
+	case yaml.MappingNode:
+		var config endpointFileConfig
+		if err := root.Content[0].Decode(&config); err != nil {
+			return nil, fmt.Errorf("invalid YAML mapping: %w", err)
 		}
 
-		lbEndpoints := make([]*endpointv3.LbEndpoint, 0, len(group.Endpoints))
-		for j, host := range group.Endpoints {
-			if host.Address == "" {
-				return nil, clusterv3.Cluster_ROUND_ROBIN, clusterv3.Cluster_EDS, fmt.Errorf("endpoint_groups[%d].endpoints[%d].address is required", i, j)
-			}
-			if host.Port == 0 {
-				return nil, clusterv3.Cluster_ROUND_ROBIN, clusterv3.Cluster_EDS, fmt.Errorf("endpoint_groups[%d].endpoints[%d].port must be > 0", i, j)
-			}
+		servicesCfg = config.Services
+		if len(servicesCfg) == 0 {
+			servicesCfg = []serviceConfig{{
+				ClusterName:     config.ClusterName,
+				ClusterLBPolicy: config.ClusterLBPolicy,
+				ClusterType:     config.ClusterType,
+				EndpointGroups:  config.EndpointGroups,
+			}}
+		}
+	default:
+		return nil, fmt.Errorf("invalid YAML root: expected mapping or sequence")
+	}
 
-			lbEndpoints = append(lbEndpoints, makeEndpoint(host.Address, host.Port))
+	if len(servicesCfg) == 0 {
+		return nil, fmt.Errorf("no services defined in config")
+	}
+
+	services := make(map[string]serviceState, len(servicesCfg))
+	for i, svc := range servicesCfg {
+		clusterName := strings.TrimSpace(svc.ClusterName)
+		if clusterName == "" {
+			return nil, fmt.Errorf("services[%d].cluster_name is required", i)
+		}
+		if _, exists := services[clusterName]; exists {
+			return nil, fmt.Errorf("services[%d].cluster_name duplicates an existing service: %s", i, clusterName)
 		}
 
-		localityGroups = append(localityGroups, &endpointv3.LocalityLbEndpoints{
-			Priority: group.Priority,
-			Locality: &corev3.Locality{
-				Region:  group.Locality.Region,
-				Zone:    group.Locality.Zone,
-				SubZone: group.Locality.SubZone,
+		clusterLBPolicy, err := parseLBPolicy(svc.ClusterLBPolicy)
+		if err != nil {
+			return nil, fmt.Errorf("services[%d]: %w", i, err)
+		}
+
+		clusterType, err := parseClusterType(svc.ClusterType)
+		if err != nil {
+			return nil, fmt.Errorf("services[%d]: %w", i, err)
+		}
+
+		localityGroups := make([]*endpointv3.LocalityLbEndpoints, 0, len(svc.EndpointGroups))
+		for j, group := range svc.EndpointGroups {
+			if len(group.Endpoints) == 0 {
+				return nil, fmt.Errorf("services[%d].endpoint_groups[%d] must contain at least one endpoint", i, j)
+			}
+
+			lbEndpoints := make([]*endpointv3.LbEndpoint, 0, len(group.Endpoints))
+			for k, host := range group.Endpoints {
+				if strings.TrimSpace(host.Address) == "" {
+					return nil, fmt.Errorf("services[%d].endpoint_groups[%d].endpoints[%d].address is required", i, j, k)
+				}
+				if host.Port == 0 {
+					return nil, fmt.Errorf("services[%d].endpoint_groups[%d].endpoints[%d].port must be > 0", i, j, k)
+				}
+
+				lbEndpoints = append(lbEndpoints, makeEndpoint(host.Address, host.Port))
+			}
+
+			localityGroups = append(localityGroups, &endpointv3.LocalityLbEndpoints{
+				Priority: group.Priority,
+				Locality: &corev3.Locality{
+					Region:  group.Locality.Region,
+					Zone:    group.Locality.Zone,
+					SubZone: group.Locality.SubZone,
+				},
+				LbEndpoints: lbEndpoints,
+			})
+		}
+
+		services[clusterName] = serviceState{
+			assignment: &endpointv3.ClusterLoadAssignment{
+				ClusterName: clusterName,
+				Endpoints:   localityGroups,
 			},
-			LbEndpoints: lbEndpoints,
-		})
+			clusterLBPolicy: clusterLBPolicy,
+			clusterType:     clusterType,
+		}
 	}
 
-	return &endpointv3.ClusterLoadAssignment{
-		ClusterName: clusterName,
-		Endpoints:   localityGroups,
-	}, clusterLBPolicy, clusterType, nil
+	return services, nil
 }
 
 func parseLBPolicy(policy string) (clusterv3.Cluster_LbPolicy, error) {
@@ -990,7 +1088,7 @@ func buildBackendCluster(name string, lbPolicy clusterv3.Cluster_LbPolicy, clust
 						GrpcServices: []*corev3.GrpcService{
 							{
 								TargetSpecifier: &corev3.GrpcService_EnvoyGrpc_{
-									EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{ClusterName: xdsClusterName},
+									EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{ClusterName: xdsCluster},
 								},
 								Timeout: durationpb.New(1 * time.Second),
 							},
@@ -1006,32 +1104,85 @@ func buildBackendCluster(name string, lbPolicy clusterv3.Cluster_LbPolicy, clust
 
 func defaultEndpointConfig() endpointFileConfig {
 	return endpointFileConfig{
-		ClusterName:     backendCluster,
-		ClusterLBPolicy: "LEAST_REQUEST",
-		EndpointGroups: []endpointGroupConfig{
+		Services: []serviceConfig{
 			{
-				Priority: 0,
-				Locality: endpointLocality{
-					Region:  "test-region",
-					Zone:    "test-zone-a",
-					SubZone: "primary",
-				},
-				Endpoints: []hostConfig{
-					{Address: "192.168.1.10", Port: 8080},
-					{Address: "192.168.1.11", Port: 8080},
+				ClusterName:     "backend_cluster",
+				ClusterLBPolicy: "LEAST_REQUEST",
+				EndpointGroups: []endpointGroupConfig{
+					{
+						Priority: 0,
+						Locality: endpointLocality{
+							Region:  "test-region",
+							Zone:    "test-zone-a",
+							SubZone: "primary",
+						},
+						Endpoints: []hostConfig{
+							{Address: "192.168.1.10", Port: 8080},
+							{Address: "192.168.1.11", Port: 8080},
+						},
+					},
+					{
+						Priority: 1,
+						Locality: endpointLocality{
+							Region:  "test-region",
+							Zone:    "test-zone-b",
+							SubZone: "failover",
+						},
+						Endpoints: []hostConfig{
+							{Address: "192.168.1.20", Port: 8080},
+						},
+					},
 				},
 			},
 			{
-				Priority: 1,
-				Locality: endpointLocality{
-					Region:  "test-region",
-					Zone:    "test-zone-b",
-					SubZone: "failover",
-				},
-				Endpoints: []hostConfig{
-					{Address: "192.168.1.20", Port: 8080},
+				ClusterName:     "foo",
+				ClusterLBPolicy: "RING_HASH",
+				EndpointGroups: []endpointGroupConfig{
+					{
+						Priority: 0,
+						Locality: endpointLocality{
+							Region:  "region1",
+							Zone:    "zone1",
+							SubZone: "primary",
+						},
+						Endpoints: []hostConfig{
+							{Address: "192.168.1.1", Port: 5000},
+						},
+					},
 				},
 			},
 		},
 	}
+}
+
+func sortedServiceNames(services map[string]serviceState) []string {
+	names := make([]string, 0, len(services))
+	for name := range services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func copyServiceMap(in map[string]serviceState) map[string]serviceState {
+	out := make(map[string]serviceState, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func targetNames(services map[string]serviceState, includeAll bool, subscribed map[string]struct{}) []string {
+	if includeAll {
+		return sortedServiceNames(services)
+	}
+
+	names := make([]string, 0, len(subscribed))
+	for name := range subscribed {
+		if _, ok := services[name]; ok {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }

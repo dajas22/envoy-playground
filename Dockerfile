@@ -1,5 +1,5 @@
 # Build stage
-FROM docker.ops.iszn.cz/szn-image/golang-build:latest AS builder
+FROM golang:tip-trixie AS builder
 
 WORKDIR /app
 
@@ -16,7 +16,7 @@ COPY . .
 RUN go build -o empty-xds .
 
 # Runtime stage
-FROM docker.ops.iszn.cz/baseimage/ubuntu:noble
+FROM ubuntu:24.04
 
 
 WORKDIR /root/

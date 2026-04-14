@@ -46,11 +46,11 @@ static_resources:
               - endpoint:
                   address:
                     socket_address:
-                      address: xds
+                      address: envoy-xds
                       port_value: 5000
 
 
-    - name: trouba
+    - name: foo
       connect_timeout: 1s
       type: STRICT_DNS
       lb_policy: RING_HASH
@@ -72,7 +72,7 @@ static_resources:
           unhealthy_threshold: 1
           healthy_threshold: 1
       load_assignment:
-        cluster_name: trouba
+        cluster_name: foo
         endpoints:
           - locality:
               zone: zone1
@@ -116,7 +116,7 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
-    - name: listener_trouba
+    - name: listener_foo
       address:
         socket_address:
           address: 0.0.0.0
@@ -126,18 +126,18 @@ static_resources:
             - name: envoy.filters.network.http_connection_manager
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-                stat_prefix: ingress_http_trouba
+                stat_prefix: ingress_http_foo
                 codec_type: AUTO
                 route_config:
-                  name: route_config_trouba
+                  name: route_config_foo
                   virtual_hosts:
-                    - name: trouba
+                    - name: foo
                       domains: ["*"]
                       routes:
                         - match:
                             prefix: "/"
                           route:
-                            cluster: trouba
+                            cluster: foo
                             timeout: 30s
                 http_filters:
                   - name: envoy.filters.http.router

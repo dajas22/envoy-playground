@@ -1,119 +1,130 @@
 # priorityXDS
 
-Tento adresar obsahuje minimalni reproduktor pro testovani chovani Envoye pri
-EDS odpovedi s vice endpoint groupami a prioritnim failoverem.
+This directory contains a minimal reproducer for testing Envoy behavior with
+an EDS response that contains multiple endpoint groups and priority failover.
 
-Smyslem testu je overit, ze Envoy korektne nacita `ClusterLoadAssignment` pro
-`backend_cluster`, kde jsou dve skupiny endpointu:
+The purpose of this test is to verify that Envoy correctly loads a
+`ClusterLoadAssignment` for `backend_cluster`, where there are two endpoint
+groups:
 
-- primarni skupina s `priority: 0`
-- failover skupina s `priority: 1`
+- primary group with `priority: 0`
+- failover group with `priority: 1`
 
-## Jak to funguje
+## How It Works
 
-- `main.go` implementuje jednoduchy gRPC EDS server v Go.
-- Server posloucha na portu `5000`.
-- Endpoint konfigurace se nacita ze souboru `endpoints.json` a je periodicky
-  sledovana.
-- Server exportuje `EndpointDiscoveryService` a gRPC health endpoint, aby
-  odpovidal tomu, jak v repozitari vypada gRPC cluster pro Envoy.
-- Pro resource type `envoy.config.endpoint.v3.ClusterLoadAssignment` vraci
-  odpoved pro `backend_cluster`.
-- Odpoved obsahuje dve endpoint groupy:
-  - `priority: 0` s endpointy `192.168.1.10:8080` a `192.168.1.11:8080`
-  - `priority: 1` s endpointem `192.168.1.20:8080`
-- Pri zmene `endpoints.json` XDS server nacte novou konfiguraci a posle novou
-  EDS verzi do otevrenych streamu.
-- `envoy.yaml` obsahuje:
-  - `xds_cluster` definovany jako gRPC upstream ve stylu `newGrpcCluster`
-  - `backend_cluster` definovany jako EDS cluster ve stylu `newHttpEdsCluster`
-  - staticky listener a route, ktere smeruji provoz do `backend_cluster`
-- `docker-compose.yml` spousti dve sluzby:
-  - `xds`: lokalni gRPC EDS server
+- `main.go` implements a simple gRPC EDS server in Go.
+- The server listens on port `5000`.
+- Endpoint configuration is loaded from `endpoints.yaml` and watched
+  periodically.
+- The server exports `EndpointDiscoveryService` and a gRPC health endpoint, so
+  it matches how the Envoy gRPC cluster is defined in this repository.
+- For resource type `envoy.config.endpoint.v3.ClusterLoadAssignment`, it
+  returns a response for `backend_cluster`.
+- The response contains two endpoint groups:
+  - `priority: 0` with endpoints `192.168.1.10:8080` and `192.168.1.11:8080`
+  - `priority: 1` with endpoint `192.168.1.20:8080`
+- When `endpoints.yaml` changes, the XDS server loads the new configuration and
+  pushes a new EDS version to open streams.
+- `envoy.yaml` contains:
+  - `xds_cluster` defined as a gRPC upstream in the style of `newGrpcCluster`
+  - `backend_cluster` defined as an EDS cluster in the style of
+    `newHttpEdsCluster`
+  - a static listener and route that direct traffic to `backend_cluster`
+- `docker-compose.yml` starts two services:
+  - `xds`: local gRPC EDS server
   - `envoy`: Envoy `v1.37.1`
 
-## Co se tim testuje
+## What This Tests
 
-Test overuje, jak se Envoy zachova, kdyz:
+The test verifies how Envoy behaves when it:
 
-1. nabootuje s validni konfiguraci,
-2. uspesne se pripoji na gRPC EDS server,
-3. dostane pro upstream cluster validni EDS odpoved,
-4. tato odpoved obsahuje backend endpointy rozdelene do dvou priorit.
+1. boots with a valid configuration,
+2. successfully connects to the gRPC EDS server,
+3. receives a valid EDS response for the upstream cluster,
+4. receives backend endpoints split across two priorities.
 
-Ocekavany vysledek testu je, ze Envoy nespadne a v konfiguraci bude mit
-`backend_cluster` se dvema prioritami endpointu. Pri nedostupnosti `priority: 0`
-muze prejit na `priority: 1`.
+The expected result is that Envoy does not crash and has a `backend_cluster`
+configuration with two endpoint priorities. If `priority: 0` becomes
+unavailable, Envoy can fail over to `priority: 1`.
 
-## Dynamicka uprava endpointu
+## Dynamic Endpoint Updates
 
-Konfigurace endpointu je v `endpoints.json` v tomto formatu:
+Endpoint configuration is stored in `endpoints.yaml` in this format:
 
-```json
-{
-  "cluster_name": "backend_cluster",
-  "endpoint_groups": [
-    {
-      "priority": 0,
-      "locality": {
-        "region": "test-region",
-        "zone": "test-zone-a",
-        "sub_zone": "primary"
-      },
-      "endpoints": [
-        { "address": "192.168.1.10", "port": 8080 }
-      ]
-    }
-  ]
-}
+```yaml
+services:
+  - cluster_name: backend_cluster
+    cluster_lb_policy: LEAST_REQUEST
+    endpoint_groups:
+      - priority: 0
+        locality:
+          region: test-region
+          zone: test-zone-a
+          sub_zone: primary
+        endpoints:
+          - address: 192.168.1.10
+            port: 8080
+
+  - cluster_name: foo
+    cluster_lb_policy: RING_HASH
+    endpoint_groups:
+      - priority: 0
+        locality:
+          region: region1
+          zone: zone1
+          sub_zone: primary
+        endpoints:
+          - address: 192.168.1.1
+            port: 5000
 ```
 
-Po ulozeni souboru se konfigurace behem cca 1 sekundy nacte a XDS server posle
-aktualizaci klientum.
+After saving the file, the configuration is reloaded in about 1 second and the
+XDS server pushes an update to connected clients.
 
-## Spusteni
+## Run
 
-Z adresare s testem:
+From the test directory:
 
 ```bash
 docker compose up --build
 ```
 
-Po startu budou dostupne:
+After startup, these endpoints are available:
 
 - Envoy listener: `http://localhost:8080`
 - Envoy admin: `http://localhost:10000`
 - XDS server: `localhost:5000`
 
-## Rucni overeni
+## Manual Verification
 
-Poslani requestu pres Envoy:
+Send a request through Envoy:
 
 ```bash
 curl -v http://localhost:8080/
 ```
 
-Uzitecne logy:
+Useful logs:
 
 ```bash
 docker compose logs -f envoy
 docker compose logs -f xds
 ```
 
-U admin rozhrani Envoye lze zkontrolovat stav clusteru a config dump, napr.:
+In the Envoy admin interface, you can inspect cluster state and config dump,
+for example:
 
 ```bash
 curl http://localhost:10000/clusters
 curl http://localhost:10000/config_dump
 
-# rychla kontrola, ze backend_cluster ma priority 0 a 1
+# quick check that backend_cluster has priorities 0 and 1
 curl -s http://localhost:10000/config_dump | grep -E 'backend_cluster|priority'
 
-# overeni endpointu a priorit primo z admin /clusters
+# verify endpoints and priorities directly from admin /clusters
 curl -s http://localhost:10000/clusters | sed -n '/backend_cluster::/,/xds_cluster::/p'
 ```
 
-## Ukonceni
+## Stop
 
 ```bash
 docker compose down

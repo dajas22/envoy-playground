@@ -1,4 +1,5 @@
-{
+# Working svc
+[{
   "cluster_name": "backend_cluster",
   "cluster_lb_policy": "RING_HASH",
   "endpoint_groups": [
@@ -29,4 +30,26 @@
       ]
     }
   ]
+},
+# Broken svc
+{
+  "cluster_name": "backend_cluster_broken",
+  "cluster_lb_policy": "RING_HASH",
+  "endpoint_groups": [
+    {
+      "priority": 1,
+      "locality": {
+        "region": "test-region",
+        "zone": "test-zone-b",
+        "sub_zone": "failover"
+      },
+      "endpoints": [
+        {
+          "address": "192.168.1.55",
+          "port": 8080
+        }
+      ]
+    }
+  ]
 }
+]
